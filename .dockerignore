@@ -1,0 +1,8 @@
+.git
+.venv
+CosyVoice
+output
+voices
+.env
+.DS_Store
+README.md
