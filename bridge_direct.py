@@ -1,40 +1,29 @@
 #!/usr/bin/env python3
 """CosyVoice Wyoming TTS bridge — DIRECT variant (no HTTP, no httpx).
 
-Differences from the httpx bridge:
+Corrected against the working server.py. Differences that mattered:
 
-  * CosyVoice is imported and loaded in-process; there is no FastAPI /
-    uvicorn middleman and no JSON serialisation per sentence.
-  * Sample rate comes from ``model.sample_rate`` — one source of truth.
-  * The zero-shot speaker embedding is computed ONCE at startup and
-    cached (``add_zero_shot_spk`` / ``zero_shot_spk_id``) instead of
-    being rebuilt on every request.
-  * Model inference is blocking torch code, so it runs in a worker
-    thread via ``asyncio.to_thread``. Calling it directly from the
-    event loop would freeze the whole Wyoming server (including the
-    reading of incoming SynthesizeChunk events) for the duration of
-    every sentence.
-  * A process-wide lock serialises inference, so two simultaneous HA
-    requests can't collide on the GPU.
+  * Class is ``AutoModel``, constructed as ``AutoModel(model_dir=...)``
+    with NO extra kwargs (load_jit/load_trt/fp16 are not accepted here).
+  * ``prompt_wav`` is passed as a FILE PATH, not a pre-loaded tensor —
+    server.py never calls load_wav().
+  * Instructions are wrapped in the CosyVoice3 envelope:
+    "You are a helpful assistant. <instruction>.<|endofprompt|>"
+  * Default mode is cross_lingual, which prefixes the TEXT with
+    "You are a helpful assistant.<|endofprompt|>" and ignores prompt
+    text entirely.
+  * The RL checkpoint swap (llm.pt -> llm.rl.pt symlink) is replicated
+    from server.py's startup(), guarded identically so it is idempotent.
+  * Speaker caching (add_zero_shot_spk) is NOT used: server.py does not
+    use it, so it is left out rather than guessed at.
+  * Speed is expressed as an instruction hint, as server.py does — the
+    inference methods take no ``speed`` kwarg.
 
-REQUIREMENTS / THINGS TO VERIFY AGAINST YOUR CHECKOUT
------------------------------------------------------
-This script must run inside the CosyVoice venv (it needs torch, numpy
-and the CosyVoice package on sys.path). The exact inference signatures
-have shifted between CosyVoice revisions, so check yours before
-trusting the defaults:
+Startup order: bind :10211 immediately, load the model in the
+background, queue any sentences that arrive during the load.
 
-    sed -n '1,140p' CosyVoice/cosyvoice/cli/cosyvoice.py
-
-Specifically confirm:
-  * the class name (``CosyVoice``) and constructor kwargs
-  * ``inference_instruct2(tts_text, instruct_text, prompt_speech, ...)``
-  * ``inference_zero_shot(tts_text, prompt_text, prompt_speech, ...)``
-  * whether ``add_zero_shot_spk`` / ``zero_shot_spk_id`` exist
-  * whether the generator yields dicts keyed ``"tts_speech"``
-
-Anything that differs is a small edit inside ``SynthEngine._call`` —
-that method is deliberately the only place that touches the model API.
+Must run inside the CosyVoice venv (torch, numpy, wyoming, and the
+CosyVoice repo on sys.path via --cosyvoice-repo).
 """
 
 from __future__ import annotations
@@ -42,6 +31,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import re
 import sys
 import threading
@@ -67,18 +57,26 @@ from wyoming.tts import (
 
 _LOGGER = logging.getLogger(__name__)
 
+ASSISTANT_PREFIX = "You are a helpful assistant."
+EOP = "<|endofprompt|>"
+
 # ---------------------------------------------------------------------------
-# Tag handling (unchanged from the httpx bridge)
+# Tag handling — values are BARE instruction bodies, wrapped at call time.
 # ---------------------------------------------------------------------------
 
 TAG_MAP = {
-    "warm": "Please speak in a warm and friendly voice.",
-    "confident": "Please speak with a confident and steady voice.",
-    "happy": "Speak with a happy and excited tone.",
-    "sad": "Speak with a sad and melancholy tone.",
-    "excited": "Speak with an excited and energetic tone.",
-    "whisper": "Please say a sentence in a very soft voice.",
-    "serious": "Please speak in a serious and calm manner.",
+    "warm": "Speak in a warm and friendly voice",
+    "confident": "Speak with a confident and steady voice",
+    "happy": "Speak with a happy and excited tone",
+    "sad": "Speak with a sad and melancholic tone",
+    "angry": "Speak with an angry tone",
+    "excited": "Speak with an excited and energetic tone",
+    "whisper": "Please say a sentence in a very soft voice",
+    "serious": "Speak in a serious and calm manner",
+    "loud": "Please say a sentence as loudly as possible",
+    "slow": "Speak as slowly as possible",
+    "fast": "Speak as fast as possible",
+    "robot": "Speak like a robot",
 }
 
 INLINE_TAGS = {"laughter", "breath", "sigh", "cough", "noise", "lipsmack", "mn"}
@@ -94,6 +92,8 @@ ALIASES = {
     "breaths": "breath",
     "sighs": "sigh",
     "coughs": "cough",
+    "melancholy": "sad",
+    "melancholic": "sad",
 }
 
 _TERM_RE = re.compile(r"[.!?…][\"'”’)\]]*\s+")
@@ -113,6 +113,7 @@ def normalize(text: str) -> str:
 
 
 def parse_tags(text: str) -> tuple[str, Optional[str]]:
+    """Split text into (spoken text, instruction body or None)."""
     text = normalize(text)
     tags: list[str] = []
     out: list[str] = []
@@ -137,7 +138,36 @@ def parse_tags(text: str) -> tuple[str, Optional[str]]:
         out.append(text[pos:])
 
     clean = " ".join("".join(out).split())
-    return clean, (" ".join(tags) if tags else None)
+    return clean, (". ".join(tags) if tags else None)
+
+
+def wrap_instruct(body: str) -> str:
+    """Apply the CosyVoice3 instruction envelope, mirroring server.py.
+
+    server.py does ``". ".join(parts) + ".<|endofprompt|>"``; we strip a
+    trailing period first so we don't emit ".." when the caller already
+    punctuated the instruction.
+    """
+    body = body.strip()
+    if body.endswith(EOP):
+        body = body[: -len(EOP)].strip()
+    if not body.startswith(ASSISTANT_PREFIX):
+        body = f"{ASSISTANT_PREFIX} {body}"
+    body = body.rstrip(".")
+    return f"{body}.{EOP}"
+
+
+def speed_hint(speed: float) -> Optional[str]:
+    """Instruction-based speed control, matching server.py's thresholds."""
+    if speed == 1.0:
+        return None
+    if speed < 0.7:
+        return "Speak as slowly as possible"
+    if speed < 1.0:
+        return "Speak a bit slower than normal"
+    if speed > 1.5:
+        return "Speak as fast as possible"
+    return "Speak a bit faster than normal"
 
 
 # ---------------------------------------------------------------------------
@@ -145,15 +175,14 @@ def parse_tags(text: str) -> tuple[str, Optional[str]]:
 # ---------------------------------------------------------------------------
 
 def to_pcm16(tensor: Any) -> bytes:
-    """Convert a CosyVoice output tensor to little-endian signed 16-bit PCM.
+    """CosyVoice float waveform [-1, 1] -> little-endian PCM16 bytes.
 
-    CosyVoice yields float waveforms in roughly [-1, 1]; the Wyoming
-    client expects raw PCM16, so clip before scaling to avoid wraparound
-    on the occasional overshoot.
+    Mirrors server.py's _to_pcm16 (clamp, squeeze batch dim, scale).
     """
-    arr = tensor.detach().to("cpu", torch.float32).numpy().reshape(-1)
-    arr = np.clip(arr, -1.0, 1.0)
-    return (arr * 32767.0).astype("<i2").tobytes()
+    x = tensor.detach().cpu().float().clamp(-1.0, 1.0)
+    if x.dim() == 2:
+        x = x.squeeze(0)
+    return (x * 32767.0).to(torch.int16).numpy().tobytes()
 
 
 # ---------------------------------------------------------------------------
@@ -166,102 +195,96 @@ class SynthEngine:
     def __init__(
         self,
         model_dir: str,
-        prompt_wav: Optional[str],
+        prompt_wav: str,
         prompt_text: str,
-        spk_id: Optional[str],
         mode: str,
         default_instruct: Optional[str],
         speed: float,
-        fp16: bool,
+        use_rl: bool,
     ) -> None:
         self.model_dir = model_dir
         self.prompt_wav = prompt_wav
         self.prompt_text = prompt_text
-        self.spk_id = spk_id
         self.mode = mode
         self.default_instruct = default_instruct
         self.speed = speed
-        self.fp16 = fp16
+        self.use_rl = use_rl
 
         self.model: Any = None
-        self.prompt_speech: Any = None
         self.sample_rate: int = 24000
-        self._spk_registered = False
-        # Serialises GPU work across concurrent utterances.
         self._lock = threading.Lock()
 
     # -- startup ------------------------------------------------------------
 
+    def _swap_rl_checkpoint(self) -> None:
+        """Replicate server.py's startup() RL swap, idempotently.
+
+        server.py renames llm.pt -> llm.base.pt and symlinks llm.rl.pt
+        in its place. Guarded exactly as server.py guards it, so running
+        this repeatedly is a no-op.
+        """
+        rl = os.path.join(self.model_dir, "llm.rl.pt")
+        llm = os.path.join(self.model_dir, "llm.pt")
+        bak = os.path.join(self.model_dir, "llm.base.pt")
+        if os.path.exists(rl) and not os.path.exists(bak):
+            _LOGGER.info("swapping in RL checkpoint (llm.pt -> llm.rl.pt)")
+            os.rename(llm, bak)
+            os.symlink("llm.rl.pt", llm)
+        elif os.path.exists(bak):
+            _LOGGER.info("RL checkpoint already swapped in")
+
     def load(self) -> None:
-        from cosyvoice.cli.cosyvoice import CosyVoice  # noqa: PLC0415
-        from cosyvoice.utils.file_utils import load_wav  # noqa: PLC0415
+        from cosyvoice.cli.cosyvoice import AutoModel  # noqa: PLC0415
+
+        if self.use_rl:
+            try:
+                self._swap_rl_checkpoint()
+            except Exception:
+                _LOGGER.exception("RL swap failed; continuing with current llm.pt")
 
         _LOGGER.info("loading model from %s", self.model_dir)
         t0 = time.monotonic()
-        try:
-            self.model = CosyVoice(
-                self.model_dir, load_jit=False, load_trt=False, fp16=self.fp16
-            )
-        except TypeError:
-            # Older/newer revisions may not accept the same kwargs.
-            _LOGGER.warning("constructor kwargs rejected; falling back to positional")
-            self.model = CosyVoice(self.model_dir)
 
-        self.sample_rate = int(getattr(self.model, "sample_rate", 24000))
+        # Exactly the construction server.py uses: keyword only, no
+        # load_jit / load_trt / fp16 — AutoModel does not take them.
+        self.model = AutoModel(model_dir=self.model_dir)
+
+        self.sample_rate = int(self.model.sample_rate)
         _LOGGER.info(
-            "model ready in %.1fs (sample_rate=%d)", time.monotonic() - t0, self.sample_rate
+            "model ready in %.1fs (sample_rate=%d)",
+            time.monotonic() - t0, self.sample_rate,
         )
 
-        if not self.prompt_wav:
-            _LOGGER.warning("no --prompt-wav given; instruct/zero-shot modes will fail")
-            return
-
-        # Prompt features are extracted ONCE here rather than per request.
-        self.prompt_speech = load_wav(self.prompt_wav, 16000)
-
-        if self.spk_id:
-            try:
-                self.model.add_zero_shot_spk(
-                    self.prompt_text, self.prompt_speech, self.spk_id
-                )
-                save = getattr(self.model, "save_spkinfo", None)
-                if callable(save):
-                    save()
-                self._spk_registered = True
-                _LOGGER.info("registered cached speaker %r", self.spk_id)
-            except Exception:
-                _LOGGER.exception(
-                    "could not register speaker %r; falling back to per-call prompt",
-                    self.spk_id,
-                )
+        if not self.prompt_wav or not os.path.exists(self.prompt_wav):
+            raise RuntimeError(f"prompt WAV not found: {self.prompt_wav!r}")
 
     # -- inference ----------------------------------------------------------
 
     def _call(self, text: str, instructions: Optional[str]) -> Iterator[Any]:
-        """Dispatch to the right CosyVoice entry point.
+        """Dispatch mirroring server.py's _generate().
 
-        This is the single adapter between the bridge and the model API;
-        adjust here if your checkout's signatures differ.
+        All three entry points take the prompt WAV as a PATH.
         """
-        kwargs: dict[str, Any] = {"stream": True}
-        if self.speed != 1.0:
-            kwargs["speed"] = self.speed
+        instruct_body = instructions or self.default_instruct
+        hint = speed_hint(self.speed)
+        if hint:
+            instruct_body = f"{instruct_body}. {hint}" if instruct_body else hint
 
-        if self.mode == "instruct":
-            instruct = instructions or self.default_instruct
-            if instruct:
-                return self.model.inference_instruct2(
-                    text, instruct, self.prompt_speech, **kwargs
-                )
-
-        if self._spk_registered:
-            # Cached speaker: no prompt text / speech needed per call.
-            return self.model.inference_zero_shot(
-                text, "", "", zero_shot_spk_id=self.spk_id, **kwargs
+        if instruct_body:
+            return self.model.inference_instruct2(
+                text, wrap_instruct(instruct_body), self.prompt_wav, stream=True
             )
 
-        return self.model.inference_zero_shot(
-            text, self.prompt_text, self.prompt_speech, **kwargs
+        if self.mode == "zero_shot":
+            prompt_text = self.prompt_text or f"{ASSISTANT_PREFIX}{EOP}"
+            return self.model.inference_zero_shot(
+                text, prompt_text, self.prompt_wav, stream=True
+            )
+
+        # Default: cross_lingual, prefix glued onto the TEXT (server.py
+        # does the same — prompt text is unused in this mode).
+        return self.model.inference_cross_lingual(
+            f"{ASSISTANT_PREFIX}{EOP}{text}", self.prompt_wav, stream=True
         )
 
     def synthesize(self, text: str, instructions: Optional[str]) -> tuple[bytes, int]:
@@ -286,6 +309,7 @@ class BridgeHandler(AsyncEventHandler):
         info: Info,
         voice: str,
         sample_rate: int,
+        ready: asyncio.Event,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -293,9 +317,10 @@ class BridgeHandler(AsyncEventHandler):
         self.info = info
         self.voice = voice
         self.sample_rate = sample_rate
+        self._ready = ready
 
-        self._stash = ""            # legacy single-shot Synthesize text
-        self._buf = ""              # sentence accumulation
+        self._stash = ""
+        self._buf = ""
         self._got_chunks = False
         self._audio_started = False
         self._stream_rate: Optional[int] = None
@@ -336,7 +361,7 @@ class BridgeHandler(AsyncEventHandler):
         if self._fetch_task is None:
             return
         await self._work_q.put(None)
-        await self._fetch_task          # forwards its own sentinel onward
+        await self._fetch_task
         await self._play_q.put(None)
         await self._play_task
         self._fetch_task = None
@@ -347,12 +372,9 @@ class BridgeHandler(AsyncEventHandler):
     # -- workers ---------------------------------------------------------------
 
     async def _fetch_worker(self) -> None:
-        """Synthesize sentences off the event loop, one at a time.
+        """Synthesize sentences off the event loop, one at a time."""
+        await self._ready.wait()
 
-        ``asyncio.to_thread`` keeps the loop responsive while torch
-        crunches, which is what lets SynthesizeChunk events keep being
-        parsed (and therefore lets the LLM stay ahead of playback).
-        """
         while (text := await self._work_q.get()) is not None:
             clean, instructions = parse_tags(text)
             if not clean:
@@ -470,33 +492,36 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Model dir; defaults to <repo>/pretrained_models/Fun-CosyVoice3-0.5B",
     )
-    p.add_argument("--prompt-wav", default=None, help="Reference speaker WAV")
+    p.add_argument(
+        "--prompt-wav",
+        required=True,
+        help="Reference speaker WAV path (passed straight to the model)",
+    )
     p.add_argument(
         "--prompt-text",
         default="",
-        help="Transcript of the reference WAV (needed for zero-shot prompting)",
-    )
-    p.add_argument(
-        "--spk-id",
-        default="ha-default",
-        help="Cache the speaker embedding under this id (empty to disable)",
+        help="Transcript of the reference WAV (only used in zero_shot mode)",
     )
     p.add_argument(
         "--mode",
-        choices=["instruct", "zero_shot"],
-        default="instruct",
-        help="instruct = use inference_instruct2 with tag instructions; "
-        "zero_shot = plain cloning",
+        choices=["cross_lingual", "zero_shot", "instruct"],
+        default="cross_lingual",
+        help="cross_lingual matches server.py's default; instruct forces "
+        "inference_instruct2 for every sentence",
     )
     p.add_argument(
         "--instruct",
         default=None,
-        help="Fallback instruction when a sentence carries no tag",
+        help="Baseline instruction applied to every sentence (tag overrides it)",
     )
-    p.add_argument("--speed", type=float, default=1.0)
-    p.add_argument("--fp16", action="store_true", help="Half precision on CUDA")
+    p.add_argument("--speed", type=float, default=1.0, help="1.0 = normal")
+    p.add_argument(
+        "--use-rl",
+        action="store_true",
+        help="Swap in llm.rl.pt as llm.pt, as server.py's startup() does",
+    )
     p.add_argument("--voice", default="nicoleheart", help="Voice name reported to HA")
-    p.add_argument("--sample-rate", type=int, default=24000, help="Reported rate (fallback)")
+    p.add_argument("--sample-rate", type=int, default=24000, help="Fallback rate")
     return p.parse_args()
 
 
@@ -508,7 +533,6 @@ async def main() -> None:
     if not repo.is_dir():
         raise SystemExit(f"CosyVoice repo not found: {repo}")
 
-    # CosyVoice is a repo, not a wheel: it and Matcha-TTS must be importable.
     for extra in (repo, repo / "third_party" / "Matcha-TTS"):
         if extra.is_dir():
             sys.path.insert(0, str(extra))
@@ -519,14 +543,24 @@ async def main() -> None:
         model_dir=model_dir,
         prompt_wav=args.prompt_wav,
         prompt_text=args.prompt_text,
-        spk_id=args.spk_id or None,
         mode=args.mode,
         default_instruct=args.instruct,
         speed=args.speed,
-        fp16=args.fp16,
+        use_rl=args.use_rl,
     )
-    # Blocking load, deliberately before the server starts listening.
-    await asyncio.to_thread(engine.load)
+
+    ready = asyncio.Event()
+
+    async def _load_engine() -> None:
+        try:
+            await asyncio.to_thread(engine.load)
+        except Exception:
+            _LOGGER.critical("model load failed", exc_info=True)
+            os._exit(1)
+        _LOGGER.info("engine ready — synthesis enabled")
+        ready.set()
+
+    loader = asyncio.create_task(_load_engine())
 
     attribution = Attribution(
         name="FunAudioLLM",
@@ -556,7 +590,10 @@ async def main() -> None:
     )
 
     server = AsyncServer.from_uri(args.uri)
-    _LOGGER.info("starting on %s (model=%s)", args.uri, model_dir)
+    _LOGGER.info(
+        "listening on %s (model=%s) — loading model in background",
+        args.uri, model_dir,
+    )
 
     await server.run(
         partial(
@@ -565,6 +602,7 @@ async def main() -> None:
             info=info,
             voice=args.voice,
             sample_rate=args.sample_rate,
+            ready=ready,
         )
     )
 
