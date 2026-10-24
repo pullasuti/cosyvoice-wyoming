@@ -2,22 +2,27 @@
 """CosyVoice Wyoming TTS bridge — DIRECT variant (no HTTP, no httpx).
 
 Aligned with server.py (AutoModel, path-based prompt wav, instruction
-envelope, RL swap) plus anti-stutter measures derived from measured
-timings (per-sentence first yield ≈ +1.7s, first-segment rtf ≈ 1.5):
+envelope) plus anti-stutter and robustness measures:
 
-  1. SENTENCE MERGING — short sentences are batched until the estimated
-     speech length reaches --min-merged-seconds (default 4s). This
-     amortizes the model's ~1s per-request flow warmup over longer
-     generations (where rtf drops well below 1.0).
-  2. PRE-BUFFERING (jitter buffer) — AudioStart is not emitted until
-     --prebuffer-seconds of audio (default 1.5s) is queued or the
-     utterance is fully generated. Once playback has started, every
-     chunk is written immediately — hold is only a startup buffer.
-  3. Chunk pass-through — model yields are forwarded as they arrive.
-  4. fp16 — AutoModel(model_dir=..., fp16=True) halves compute on
-     CUDA. Upstream CosyVoice3 supports the kwarg; quality of the
-     cloned voice should be A/B-tested after enabling. Note CosyVoice
-     silently disables fp16 when no CUDA device is visible.
+  1. SENTENCE MERGING — sentences batched to --min-merged-seconds of
+     estimated speech, amortizing the model's per-request warmup.
+  2. PRE-BUFFERING (jitter buffer) — AudioStart deferred until
+     --prebuffer-seconds is queued; afterwards every chunk is written
+     immediately.
+  3. UNIFORM RE-CHUNKING — PCM is re-emitted in fixed-size AudioChunks
+     of --samples-per-chunk samples, with the short remainder carried
+     across model yields (single flush at end of utterance).
+  4. WYOMING ERROR EVENTS — synthesis failures are reported to the
+     client via wyoming.error.Error so HA surfaces a failed TTS call
+     with a reason instead of silent truncation. Remaining blocks of
+     the utterance still run.
+  5. GRACEFUL SHUTDOWN — SIGINT/SIGTERM cancel the server cleanly.
+  6. RL CHECKPOINT RELOAD — uses cosyvoice.model.load(llm.rl.pt, ...)
+     when available (no filesystem surgery); falls back to the
+     rename-and-symlink swap if the revision lacks .load().
+  7. fp16 — AutoModel(model_dir=..., fp16=True) halves compute on
+     CUDA. Silently disabled by CosyVoice if no CUDA device is visible
+     (startup log + post-load check surface that).
 
 Startup order: bind :10211 immediately, load the model in the
 background, queue any sentences that arrive during the load.
@@ -33,6 +38,7 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import sys
 import threading
 import time
@@ -44,6 +50,7 @@ import numpy as np
 import torch
 
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
+from wyoming.error import Error
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
@@ -222,7 +229,7 @@ class SynthEngine:
     # -- startup ------------------------------------------------------------
 
     def _swap_rl_checkpoint(self) -> None:
-        """Replicate server.py's startup() RL swap, idempotently."""
+        """Fallback: replicate server.py's rename-and-symlink RL swap."""
         rl = os.path.join(self.model_dir, "llm.rl.pt")
         llm = os.path.join(self.model_dir, "llm.pt")
         bak = os.path.join(self.model_dir, "llm.base.pt")
@@ -233,22 +240,43 @@ class SynthEngine:
         elif os.path.exists(bak):
             _LOGGER.info("RL checkpoint already swapped in")
 
+    def _load_rl_weights(self) -> None:
+        """Preferred: reload RL weights in memory via model.load().
+
+        Cleaner than the file swap — no mutation of the model dir, no
+        risk of a fresh download silently reverting to the base
+        checkpoint. Falls back to the file swap if this CosyVoice
+        revision does not expose .load().
+        """
+        llm_rl = os.path.join(self.model_dir, "llm.rl.pt")
+        flow = os.path.join(self.model_dir, "flow.pt")
+        hift = os.path.join(self.model_dir, "hift.pt")
+        if not os.path.exists(llm_rl):
+            _LOGGER.warning(
+                "%s not found; keeping whatever llm.pt resolves to", llm_rl
+            )
+            return
+
+        try:
+            inner = self.model.model  # AutoModel -> CosyVoice3 -> .model
+            load_fn = getattr(inner, "load", None)
+            if not callable(load_fn):
+                raise AttributeError("inner model has no .load()")
+            load_fn(llm_rl, flow, hift)
+            _LOGGER.info("reloaded LLM weights from %s (in-memory, no file swap)", llm_rl)
+        except Exception:
+            _LOGGER.warning(
+                "model.load() RL reload unavailable (%s); "
+                "falling back to file-swap", exc_info=True,
+            )
+            self._swap_rl_checkpoint()
+
     def load(self) -> None:
         from cosyvoice.cli.cosyvoice import AutoModel  # noqa: PLC0415
-
-        if self.use_rl:
-            try:
-                self._swap_rl_checkpoint()
-            except Exception:
-                _LOGGER.exception("RL swap failed; continuing with current llm.pt")
 
         _LOGGER.info("loading model from %s (fp16=%s)", self.model_dir, self.fp16)
         t0 = time.monotonic()
 
-        # Upstream main: AutoModel is a factory dispatching on the yaml
-        # in the model dir (cosyvoice3.yaml -> CosyVoice3) and
-        # CosyVoice3.__init__ accepts fp16. Older revisions may not —
-        # fall back to fp32 rather than dying.
         if self.fp16:
             try:
                 self.model = AutoModel(model_dir=self.model_dir, fp16=True)
@@ -260,6 +288,9 @@ class SynthEngine:
                 self.model = AutoModel(model_dir=self.model_dir)
         else:
             self.model = AutoModel(model_dir=self.model_dir)
+
+        if self.use_rl:
+            self._load_rl_weights()
 
         # CosyVoice silently forces fp16 off when no CUDA device is
         # visible — surface that so a misconfigured GPU isn't mistaken
@@ -332,6 +363,7 @@ class BridgeHandler(AsyncEventHandler):
         ready: asyncio.Event,
         min_merged_seconds: float,
         prebuffer_seconds: float,
+        samples_per_chunk: int,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -342,6 +374,7 @@ class BridgeHandler(AsyncEventHandler):
         self._ready = ready
         self._min_merged = min_merged_seconds
         self._prebuffer = prebuffer_seconds
+        self._samples_per_chunk = samples_per_chunk
 
         self._stash = ""
         self._buf = ""
@@ -381,7 +414,8 @@ class BridgeHandler(AsyncEventHandler):
     def _feed_sentence(self, sentence: str) -> None:
         """Accumulate sentences; queue a merged block once the estimated
         speech length exceeds the merge threshold (amortizes the model's
-        ~1s per-request flow warmup)."""
+        per-request flow warmup). Hard cap of 6 sentences bounds onset
+        latency for fragment-heavy replies."""
         self._pending_sentences.append(sentence)
         est = sum(estimate_seconds(s) for s in self._pending_sentences)
         if est >= self._min_merged or len(self._pending_sentences) >= 6:
@@ -417,7 +451,12 @@ class BridgeHandler(AsyncEventHandler):
     # -- workers ---------------------------------------------------------------
 
     async def _fetch_worker(self) -> None:
-        """Synthesize merged blocks off the event loop, one at a time."""
+        """Synthesize merged blocks off the event loop, one at a time.
+
+        Failures are reported to the client as a Wyoming Error event so
+        HA surfaces a diagnosable failure rather than silence — but the
+        remaining blocks of the utterance still run.
+        """
         await self._ready.wait()
 
         while (text := await self._work_q.get()) is not None:
@@ -434,8 +473,17 @@ class BridgeHandler(AsyncEventHandler):
                 chunks = await asyncio.to_thread(
                     self.engine.synthesize_chunks, clean, self._instr
                 )
-            except Exception:
+            except Exception as err:
                 _LOGGER.exception("block synthesis failed: %r", clean[:60])
+                try:
+                    await self.write_event(
+                        Error(
+                            text=f"synthesis failed: {err}",
+                            code=err.__class__.__name__,
+                        ).event()
+                    )
+                except Exception:
+                    pass  # connection may already be gone
                 continue
 
             for audio, rate in chunks:
@@ -445,63 +493,78 @@ class BridgeHandler(AsyncEventHandler):
     async def _play_worker(self) -> None:
         """Write synthesized audio to the Wyoming client.
 
-        JITTER BUFFER SEMANTICS:
-          * Before AudioStart: accumulate chunks in `hold` until the
-            buffered audio reaches --prebuffer-seconds. (Or until the
-            utterance ends, for short replies.)
-          * After AudioStart: write EVERY chunk the moment it arrives.
-            `hold` is only ever a startup buffer — chunks are never
-            parked after playback has begun.
+        Semantics:
+          * JITTER BUFFER — before AudioStart, accumulate until
+            --prebuffer-seconds is buffered (or the utterance ends);
+            afterwards, drain continuously.
+          * UNIFORM CHUNKING — audio is re-emitted in fixed
+            --samples-per-chunk AudioChunks; the short remainder is
+            carried across model yields and flushed once at the end of
+            the utterance, so the player sees a constant cadence.
         """
-        hold: list[tuple[bytes, int]] = []
+        width = 2
+        bytes_per_chunk = width * self._samples_per_chunk
+
+        buf = bytearray()
+        rate: Optional[int] = None
         started = False
+        buffered_bytes = 0
+
+        async def _maybe_emit_start() -> None:
+            nonlocal started
+            if not self._audio_started and buf:
+                self._stream_rate = rate
+                await self.write_event(
+                    AudioStart(rate=rate, width=width, channels=1).event()
+                )
+                self._audio_started = True
+            started = True
 
         while (item := await self._play_q.get()) is not None:
-            audio, rate = item
+            audio, r = item
             if not audio:
                 continue
-            hold.append(item)
+
+            if rate is None:
+                rate = r
+            elif r != rate:
+                _LOGGER.warning(
+                    "sample rate changed mid-stream (%s -> %s)", rate, r
+                )
+
+            buf.extend(audio)
+            buffered_bytes += len(audio)
 
             if not started:
-                buffered_sec = sum(len(a) for a, _ in hold) / (
-                    2 * (hold[0][1] or self.sample_rate)
+                prebuffer_bytes = int(
+                    self._prebuffer * 2 * (rate or self.sample_rate)
                 )
-                if buffered_sec < self._prebuffer:
+                if buffered_bytes < prebuffer_bytes:
                     continue
-                started = True
+                await _maybe_emit_start()
 
-            # Reached only when: (a) prebuffer satisfied — flush the
-            # startup buffer, or (b) already started — write through.
-            for a, r in hold:
-                await self._emit_start_and_write(a, r)
-            hold = []
+            # Emit every complete fixed-size chunk now.
+            while len(buf) >= bytes_per_chunk:
+                await self.write_event(
+                    AudioChunk(
+                        audio=bytes(buf[:bytes_per_chunk]),
+                        rate=rate,
+                        width=width,
+                        channels=1,
+                    ).event()
+                )
+                del buf[:bytes_per_chunk]
 
-        # End sentinel: whatever is still held gets written now.
-        for a, r in hold:
-            await self._emit_start_and_write(a, r)
-        hold = []
-
-    async def _emit_start_and_write(self, audio: bytes, rate: int) -> None:
-        if not self._audio_started:
-            self._stream_rate = rate
-            await self.write_event(
-                AudioStart(rate=rate, width=2, channels=1).event()
-            )
-            self._audio_started = True
-        elif rate != self._stream_rate:
-            _LOGGER.warning(
-                "sample rate changed mid-stream (%s -> %s)", self._stream_rate, rate
-            )
-
-        for i in range(0, len(audio), 4096):
+        # End sentinel: short utterances that never reached the
+        # prebuffer threshold are emitted here in full.
+        if buf:
+            await _maybe_emit_start()
             await self.write_event(
                 AudioChunk(
-                    audio=audio[i : i + 4096],
-                    rate=rate,
-                    width=2,
-                    channels=1,
+                    audio=bytes(buf), rate=rate, width=width, channels=1
                 ).event()
             )
+            buf.clear()
 
     # -- wyoming event handling ---------------------------------------------
 
@@ -598,13 +661,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--use-rl",
         action="store_true",
-        help="Swap in llm.rl.pt as llm.pt, as server.py's startup() does",
+        help="Load RL weights (llm.rl.pt): via model.load() when available, "
+        "falling back to server.py's file swap",
     )
     p.add_argument(
         "--fp16",
         action="store_true",
-        help="Load the model in half precision (upstream CosyVoice3 kwarg; "
-        "silently disabled by CosyVoice if no CUDA device is visible)",
+        help="Load the model in half precision (silently disabled by "
+        "CosyVoice if no CUDA device is visible)",
     )
     p.add_argument(
         "--min-merged-seconds",
@@ -620,6 +684,13 @@ def parse_args() -> argparse.Namespace:
         default=1.5,
         help="Hold playback until this much audio is queued, so the "
         "player never starves mid-utterance (0 disables).",
+    )
+    p.add_argument(
+        "--samples-per-chunk",
+        type=int,
+        default=2048,
+        help="Re-emit AudioChunks of this many samples (~85ms at 24kHz "
+        "mono; remainder flushed at end of utterance).",
     )
     p.add_argument("--voice", default="nicoleheart", help="Voice name reported to HA")
     p.add_argument("--sample-rate", type=int, default=24000, help="Fallback rate")
@@ -697,18 +768,30 @@ async def main() -> None:
         args.uri, model_dir, args.fp16,
     )
 
-    await server.run(
-        partial(
-            BridgeHandler,
-            engine=engine,
-            info=info,
-            voice=args.voice,
-            sample_rate=args.sample_rate,
-            ready=ready,
-            min_merged_seconds=args.min_merged_seconds,
-            prebuffer_seconds=args.prebuffer_seconds,
+    # Graceful shutdown: SIGINT/SIGTERM cancel the server task instead
+    # of relying on default kill semantics.
+    server_task = asyncio.create_task(
+        server.run(
+            partial(
+                BridgeHandler,
+                engine=engine,
+                info=info,
+                voice=args.voice,
+                sample_rate=args.sample_rate,
+                ready=ready,
+                min_merged_seconds=args.min_merged_seconds,
+                prebuffer_seconds=args.prebuffer_seconds,
+                samples_per_chunk=args.samples_per_chunk,
+            )
         )
     )
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, server_task.cancel)
+    try:
+        await server_task
+    except asyncio.CancelledError:
+        _LOGGER.info("server stopped")
 
 
 if __name__ == "__main__":
