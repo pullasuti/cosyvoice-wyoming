@@ -1,4 +1,8 @@
 import sys, os, io, tempfile, glob
+import asyncio
+import queue
+import threading
+from fastapi.responses import Response, StreamingResponse
 from enum import Enum
 from typing import Optional
 from dotenv import load_dotenv
@@ -13,7 +17,6 @@ sys.path.insert(0, os.path.join(COSYVOICE_DIR, "third_party/Matcha-TTS"))
 import torch
 import torchaudio
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from cosyvoice.cli.cosyvoice import AutoModel
 
@@ -155,6 +158,11 @@ class SpeechRequest(BaseModel):
                     "Example: 'Speak with a cheerful tone' or 'Whisper softly'. "
                     "Can also use CosyVoice format: 'You are a helpful assistant. <instruction>.<|endofprompt|>'",
     )
+    stream: bool = Field(
+        default=False,
+        description="Return raw PCM s16le chunks as they are decoded, "
+                    "instead of a complete WAV/MP3 file.",
+    )
 
 
 def _build_instruct(instructions: str, speed: float) -> str:
@@ -162,7 +170,11 @@ def _build_instruct(instructions: str, speed: float) -> str:
         return ""
     parts = []
     if instructions:
-        clean = instructions.strip().rstrip("<|endofprompt|>").strip()
+        #clean = instructions.strip().rstrip("<|endofprompt|>").strip()
+        clean = instructions.strip()
+        if clean.endswith("<|endofprompt|>"):
+            clean = clean[:-len("<|endofprompt|>")].strip()
+
         if clean.startswith("You are a helpful assistant."):
             parts.append(clean)
         else:
@@ -178,15 +190,20 @@ def _build_instruct(instructions: str, speed: float) -> str:
             parts.append("Speak a bit faster than normal")
     return ". ".join(parts) + ".<|endofprompt|>" if parts else ""
 
-
-def _generate(text: str, prompt_wav: str, instruct_text: str = ""):
+def _generate(text: str, prompt_wav: str, instruct_text: str = "", stream: bool = False):
     if instruct_text:
-        return model.inference_instruct2(text, instruct_text, prompt_wav, stream=False)
+        return model.inference_instruct2(text, instruct_text, prompt_wav, stream=stream)
     return model.inference_cross_lingual(
         f"You are a helpful assistant.<|endofprompt|>{text}",
-        prompt_wav, stream=False,
+        prompt_wav, stream=stream,
     )
 
+
+def _to_pcm16(x: torch.Tensor) -> bytes:
+    x = x.detach().cpu().float().clamp(-1.0, 1.0)
+    if x.dim() == 2:
+        x = x.squeeze(0)
+    return (x * 32767.0).to(torch.int16).numpy().tobytes()
 
 def _encode(audio: torch.Tensor, fmt: ResponseFormat) -> tuple[bytes, str]:
     buf = io.BytesIO()
@@ -202,9 +219,14 @@ def _encode(audio: torch.Tensor, fmt: ResponseFormat) -> tuple[bytes, str]:
     response_class=Response,
     responses={200: {"content": {"audio/wav": {}, "audio/mpeg": {}}}},
 )
-async def openai_speech(req: SpeechRequest):
+#async def openai_speech(req: SpeechRequest):
+def openai_speech(req: SpeechRequest):
     prompt_wav = _get_voice(req.voice)
     instruct_text = _build_instruct(req.instructions, req.speed)
+
+    if req.stream:
+        return _stream_pcm(req.input, prompt_wav, instruct_text)
+
     gen = _generate(req.input, prompt_wav, instruct_text)
     audio = torch.cat([c["tts_speech"] for c in gen], dim=1)
     data, mime = _encode(audio, req.response_format)
@@ -212,6 +234,39 @@ async def openai_speech(req: SpeechRequest):
     return Response(content=data, media_type=mime,
                     headers={"Content-Disposition": f"attachment; filename=speech.{ext}"})
 
+
+def _stream_pcm(text: str, prompt_wav: str, instruct_text: str) -> StreamingResponse:
+    q: "queue.Queue" = queue.Queue(maxsize=8)
+
+    def _run():
+        try:
+            for chunk in _generate(text, prompt_wav, instruct_text, stream=True):
+                q.put(("chunk", _to_pcm16(chunk["tts_speech"])))
+        except Exception as exc:
+            q.put(("error", exc))
+        finally:
+            q.put(("end", None))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    async def _iter():
+        while True:
+            kind, payload = await asyncio.to_thread(q.get)
+            if kind == "end":
+                return
+            if kind == "error":
+                raise payload
+            yield payload
+
+    return StreamingResponse(
+        _iter(),
+        media_type="audio/pcm",
+        headers={
+            "X-Audio-Sample-Rate": str(model.sample_rate),
+            "X-Audio-Channels": "1",
+            "X-Audio-Sample-Format": "s16le",
+        },
+    )
 
 # ── Extended endpoint (voice cloning + emotions) ────────────
 
