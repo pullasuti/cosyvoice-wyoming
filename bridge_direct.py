@@ -212,6 +212,7 @@ class SynthEngine:
         speed: float,
         use_rl: bool,
         fp16: bool,
+        trt: bool = False,
     ) -> None:
         self.model_dir = model_dir
         self.prompt_wav = prompt_wav
@@ -221,6 +222,7 @@ class SynthEngine:
         self.speed = speed
         self.use_rl = use_rl
         self.fp16 = fp16
+        self.trt = trt
 
         self.model: Any = None
         self.sample_rate: int = 24000
@@ -271,6 +273,95 @@ class SynthEngine:
             )
             self._swap_rl_checkpoint()
 
+    def _attach_trt(self) -> None:
+        """Replace the flow decoder (DiT) with a TensorRT engine.
+
+        Done AFTER the RL weight reload on purpose: model.load() reloads
+        flow.pt too, which fails once the estimator is a TensorRT wrapper
+        (and the file-swap fallback would silently leave the base weights).
+
+        The first start builds the engine from flow.decoder.estimator.fp32.onnx
+        (several minutes) and caches it next to the model files; later starts
+        just load it. Any failure leaves the normal PyTorch flow in place.
+        NOTE: the engine always uses full attention (CosyVoice's export has no
+        'streaming' input), while PyTorch streaming uses chunked attention.
+        The model is trained with both, but listen for differences.
+        """
+        inner = getattr(self.model, "model", None)
+        load_trt = getattr(inner, "load_trt", None)
+        if not callable(load_trt):
+            _LOGGER.warning("this CosyVoice revision has no load_trt(); skipping TensorRT")
+            return
+        prec = "fp16" if self.fp16 else "fp32"
+        plan = os.path.join(self.model_dir, f"flow.decoder.estimator.{prec}.mygpu.plan")
+        onnx = os.path.join(self.model_dir, "flow.decoder.estimator.fp32.onnx")
+        if not (os.path.exists(plan) and os.path.getsize(plan) > 0) \
+                and not os.path.exists(onnx):
+            _LOGGER.warning(
+                "TensorRT: neither %s nor %s exists; keeping the PyTorch flow",
+                os.path.basename(plan), os.path.basename(onnx))
+            return
+        had_plan = os.path.exists(plan) and os.path.getsize(plan) > 0
+        if not had_plan:
+            _LOGGER.info("TensorRT: building %s engine (first run only, this "
+                         "can take several minutes) ...", prec)
+        t0 = time.monotonic()
+        original_estimator = inner.flow.decoder.estimator
+        try:
+            load_trt(plan, onnx, 1, self.fp16)
+        except Exception:
+            _LOGGER.exception("TensorRT setup failed; keeping the PyTorch flow")
+            # load_trt deletes the PyTorch estimator before the engine is
+            # deserialized, so put it back if that was the step that failed
+            if not hasattr(inner.flow.decoder, "estimator"):
+                inner.flow.decoder.estimator = original_estimator
+            try:  # a half-written plan would be reused on the next start
+                if not had_plan and os.path.exists(plan):
+                    os.remove(plan)
+            except OSError:
+                pass
+            return
+        _LOGGER.info("TensorRT flow engine ready (%s) in %.1fs",
+                     prec, time.monotonic() - t0)
+
+    def _cache_prompt_features(self) -> None:
+        """Memoize the reference-wav feature extraction in the frontend.
+
+        frontend_instruct2() re-runs the speech tokenizer, the CAM++ speaker
+        embedding and the mel extractor on the reference wav for EVERY text
+        segment. The reference never changes, so compute each once.
+        (add_zero_shot_spk is not an option here: with a cached speaker
+        CosyVoice ignores the instruct text, which would silently drop the
+        emotion instructions.) Tensors are cloned on return because the
+        frontend modifies the length tensors in place.
+        """
+        frontend = getattr(self.model, "frontend", None)
+        if frontend is None:
+            _LOGGER.warning("no frontend found; prompt features not cached")
+            return
+
+        def clone(v: Any) -> Any:
+            if isinstance(v, torch.Tensor):
+                return v.clone()
+            if isinstance(v, tuple):
+                return tuple(clone(x) for x in v)
+            return v
+
+        for name in ("_extract_speech_token", "_extract_spk_embedding",
+                     "_extract_speech_feat"):
+            fn = getattr(frontend, name, None)
+            if fn is None:
+                continue
+            cache: dict = {}
+
+            def wrapper(prompt_wav, _fn=fn, _cache=cache):
+                if prompt_wav not in _cache:
+                    _cache[prompt_wav] = _fn(prompt_wav)
+                return clone(_cache[prompt_wav])
+
+            setattr(frontend, name, wrapper)
+        _LOGGER.info("reference-voice features will be cached after first use")
+
     def load(self) -> None:
         from cosyvoice.cli.cosyvoice import AutoModel  # noqa: PLC0415
 
@@ -300,6 +391,11 @@ class SynthEngine:
                 "fp16 was requested but the model reports fp16=%s "
                 "(no CUDA device visible?)", getattr(self.model, "fp16", None)
             )
+
+        if self.trt:
+            self._attach_trt()
+
+        self._cache_prompt_features()
 
         self.sample_rate = int(self.model.sample_rate)
         _LOGGER.info(
@@ -334,18 +430,17 @@ class SynthEngine:
             f"{ASSISTANT_PREFIX}{EOP}{text}", self.prompt_wav, stream=True
         )
 
-    def synthesize_chunks(
+    def synthesize_iter(
         self, text: str, instructions: Optional[str]
-    ) -> list[tuple[bytes, int]]:
-        """Blocking. Returns a list of (pcm16 chunk, sample_rate) tuples,
-        one per model yield, so the play worker can forward them as
-        they were produced rather than as one big blob."""
+    ) -> Iterator[tuple[bytes, int]]:
+        """Blocking generator: yields (pcm16 chunk, sample_rate) as the model
+        produces them. Run it in a worker thread and forward each chunk
+        immediately; collecting them into a list first would hold back all
+        audio until the whole block is finished."""
         with self._lock:
             with torch.inference_mode():
-                return [
-                    (to_pcm16(out["tts_speech"]), self.sample_rate)
-                    for out in self._call(text, instructions)
-                ]
+                for out in self._call(text, instructions):
+                    yield to_pcm16(out["tts_speech"]), self.sample_rate
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +480,7 @@ class BridgeHandler(AsyncEventHandler):
 
         # Sentence merging accumulator
         self._pending_sentences: list[str] = []
+        self._first_queued = False
 
         self._work_q: Optional[asyncio.Queue] = None
         self._play_q: Optional[asyncio.Queue] = None
@@ -417,6 +513,11 @@ class BridgeHandler(AsyncEventHandler):
         per-request flow warmup). Hard cap of 6 sentences bounds onset
         latency for fragment-heavy replies."""
         self._pending_sentences.append(sentence)
+        if not self._first_queued:
+            # LATENCY-FIRST: don't wait to merge the opening sentence
+            self._first_queued = True
+            self._flush_pending()
+            return
         est = sum(estimate_seconds(s) for s in self._pending_sentences)
         if est >= self._min_merged or len(self._pending_sentences) >= 6:
             self._flush_pending()
@@ -470,9 +571,7 @@ class BridgeHandler(AsyncEventHandler):
             _LOGGER.info("synthesizing: text=%r instr=%r", clean[:60], self._instr)
 
             try:
-                chunks = await asyncio.to_thread(
-                    self.engine.synthesize_chunks, clean, self._instr
-                )
+                await self._stream_block(clean, self._instr)
             except Exception as err:
                 _LOGGER.exception("block synthesis failed: %r", clean[:60])
                 try:
@@ -486,9 +585,39 @@ class BridgeHandler(AsyncEventHandler):
                     pass  # connection may already be gone
                 continue
 
-            for audio, rate in chunks:
-                if audio:
-                    await self._play_q.put((audio, rate))
+    async def _stream_block(self, text: str, instructions: Optional[str]) -> None:
+        """Run the model in a worker thread and hand every chunk to the play
+        queue the moment it is produced (no waiting for the whole block)."""
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def produce() -> None:
+            try:
+                for item in self.engine.synthesize_iter(text, instructions):
+                    loop.call_soon_threadsafe(q.put_nowait, item)
+            except BaseException as err:  # noqa: BLE001
+                loop.call_soon_threadsafe(q.put_nowait, err)
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, None)
+
+        fut = loop.run_in_executor(None, produce)
+        error: Optional[BaseException] = None
+        first = True
+        t0 = time.monotonic()
+        while (item := await q.get()) is not None:
+            if isinstance(item, BaseException):
+                error = item
+                continue
+            audio, rate = item
+            if audio:
+                if first:
+                    _LOGGER.info("first audio chunk after %.2fs",
+                                 time.monotonic() - t0)
+                    first = False
+                await self._play_q.put((audio, rate))
+        await fut
+        if error is not None:
+            raise error
 
     async def _play_worker(self) -> None:
         """Write synthesized audio to the Wyoming client.
@@ -581,6 +710,7 @@ class BridgeHandler(AsyncEventHandler):
             self._stream_rate = None
             self._instr = None
             self._pending_sentences = []
+            self._first_queued = False
             await self._start_pipeline()
             return True
 
@@ -671,6 +801,12 @@ def parse_args() -> argparse.Namespace:
         "CosyVoice if no CUDA device is visible)",
     )
     p.add_argument(
+        "--trt",
+        action="store_true",
+        help="Run the flow decoder through TensorRT (builds an engine on "
+        "the first start). Falls back to PyTorch if anything fails.",
+    )
+    p.add_argument(
         "--min-merged-seconds",
         type=float,
         default=4.0,
@@ -720,6 +856,7 @@ async def main() -> None:
         speed=args.speed,
         use_rl=args.use_rl,
         fp16=args.fp16,
+        trt=args.trt,
     )
 
     ready = asyncio.Event()
