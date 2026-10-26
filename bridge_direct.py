@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """CosyVoice Wyoming TTS bridge — DIRECT variant (no HTTP, no httpx).
 
-Aligned with server.py (AutoModel, path-based prompt wav, instruction
-envelope) plus anti-stutter and robustness measures:
+Loads CosyVoice3 in-process (AutoModel, path-based prompt wav, instruction
+envelope) with anti-stutter and robustness measures:
 
   1. SENTENCE MERGING — sentences batched to --min-merged-seconds of
      estimated speech, amortizing the model's per-request warmup.
@@ -152,7 +152,7 @@ def parse_tags(text: str) -> tuple[str, Optional[str]]:
 
 
 def wrap_instruct(body: str) -> str:
-    """Apply the CosyVoice3 instruction envelope, mirroring server.py."""
+    """Apply the CosyVoice3 instruction envelope."""
     body = body.strip()
     if body.endswith(EOP):
         body = body[: -len(EOP)].strip()
@@ -163,7 +163,7 @@ def wrap_instruct(body: str) -> str:
 
 
 def speed_hint(speed: float) -> Optional[str]:
-    """Instruction-based speed control, matching server.py's thresholds."""
+    """Instruction-based speed control."""
     if speed == 1.0:
         return None
     if speed < 0.7:
@@ -187,7 +187,7 @@ def estimate_seconds(text: str) -> float:
 def to_pcm16(tensor: Any) -> bytes:
     """CosyVoice float waveform [-1, 1] -> little-endian PCM16 bytes.
 
-    Mirrors server.py's _to_pcm16 (clamp, squeeze batch dim, scale).
+    Clamps, squeezes the batch dim and scales.
     """
     x = tensor.detach().cpu().float().clamp(-1.0, 1.0)
     if x.dim() == 2:
@@ -231,7 +231,7 @@ class SynthEngine:
     # -- startup ------------------------------------------------------------
 
     def _swap_rl_checkpoint(self) -> None:
-        """Fallback: replicate server.py's rename-and-symlink RL swap."""
+        """Fallback: swap llm.pt for llm.rl.pt via rename and symlink."""
         rl = os.path.join(self.model_dir, "llm.rl.pt")
         llm = os.path.join(self.model_dir, "llm.pt")
         bak = os.path.join(self.model_dir, "llm.base.pt")
@@ -409,7 +409,7 @@ class SynthEngine:
     # -- inference ----------------------------------------------------------
 
     def _call(self, text: str, instructions: Optional[str]) -> Iterator[Any]:
-        """Dispatch mirroring server.py's _generate()."""
+        """Pick the CosyVoice inference mode for this block."""
         instruct_body = instructions or self.default_instruct
         hint = speed_hint(self.speed)
         if hint:
@@ -780,7 +780,7 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=["cross_lingual", "zero_shot", "instruct"],
         default="cross_lingual",
-        help="cross_lingual matches server.py's default",
+        help="Mode for untagged text (tagged text always uses instruct)",
     )
     p.add_argument(
         "--instruct",
@@ -792,7 +792,7 @@ def parse_args() -> argparse.Namespace:
         "--use-rl",
         action="store_true",
         help="Load RL weights (llm.rl.pt): via model.load() when available, "
-        "falling back to server.py's file swap",
+        "falling back to a file swap",
     )
     p.add_argument(
         "--fp16",

@@ -1,127 +1,99 @@
-# CosyVoice API
+# CosyVoice Wyoming bridge
 
-OpenAI-compatible text-to-speech API server with zero-shot voice cloning, powered by CosyVoice 3. Works well with Russian and English text, including mixed-language input.
+Streaming text-to-speech for Home Assistant, using
+[CosyVoice 3](https://github.com/FunAudioLLM/CosyVoice) with zero-shot voice
+cloning, emotion tags and non-verbal sounds. The model runs in-process and
+speaks the [Wyoming protocol](https://github.com/OHF-Voice/wyoming), so HA
+connects to it directly.
 
-## Quick Start
-
-### Local (recommended for Apple Silicon / Metal)
-
-On macOS with Apple Silicon, run locally to take advantage of Metal (MPS) GPU acceleration.
-Docker cannot pass through the Metal GPU, so local execution is significantly faster.
+## Quick start
 
 ```bash
 ./run.sh
 ```
 
-On first run the script will:
-- Install [uv](https://docs.astral.sh/uv/) if missing
-- Clone the CosyVoice repository
-- Install Python dependencies
-- Download the model from HuggingFace (~8 GB)
+The first run installs uv if needed, fetches the CosyVoice fork (git
+submodule), builds a Python 3.10 venv, and downloads
+`Fun-CosyVoice3-0.5B-2512` (~8 GB). With TensorRT on, the first start also
+builds the flow-decoder engine, which takes several minutes and is cached
+next to the model. Later runs start straight away.
 
-Server starts on `http://localhost:8020`
+The bridge listens on `tcp://0.0.0.0:10211` and accepts connections while
+the model is still loading.
 
-### Docker
+- `SETUP_ONLY=1 ./run.sh` sets everything up without starting the bridge.
+- `REINSTALL=1 ./run.sh` reinstalls the Python dependencies.
+- Extra arguments go to `bridge_direct.py` (`./run.sh --help` lists them).
 
-```bash
-docker build -t cosyvoice-api .
-docker run -p 8020:8020 --env-file .env cosyvoice-api
-```
-
-> **Note:** The Docker image is large (~15 GB) because it bundles the model weights.
-> Docker runs on CPU only. For NVIDIA GPU support, use `--gpus all` with an NVIDIA runtime installed.
-
-## Usage
-
-### OpenAI-compatible endpoint
-
-Drop-in replacement for `POST /v1/audio/speech`:
-
-```bash
-curl -s http://localhost:8020/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{"input": "Hello, world!", "voice": "default"}' \
-  -o speech.wav
-```
-
-Works with the official OpenAI Python client:
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8020/v1", api_key="unused")
-response = client.audio.speech.create(
-    model="cosyvoice3-0.5b",
-    voice="default",
-    input="Hello, world!",
-    response_format="wav",
-)
-response.stream_to_file("speech.wav")
-```
-
-### Extended endpoint with voice cloning
-
-Upload a voice sample (WAV, 3-15s) for zero-shot cloning:
-
-```bash
-curl -s -X POST http://localhost:8020/tts \
-  -F "text=Hello from a cloned voice!" \
-  -F "voice=@sample.wav" \
-  -o cloned.wav
-```
-
-### Emotion presets
-
-```bash
-curl -s http://localhost:8020/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{"input": "This is exciting!", "instructions": "Speak with a happy and excited tone"}' \
-  -o happy.wav
-```
-
-Available presets via `/tts` endpoint: `happy`, `sad`, `angry`, `whisper`, `loud`, `slow`, `fast`, `robot`.
-
-### List voices
-
-```bash
-curl http://localhost:8020/voices
-```
-
-### Record a voice sample (macOS)
-
-```bash
-bash record.sh my_voice
-```
-
-Records using `sox` (installed via Homebrew if missing) and saves to `voices/my_voice.wav`. Set `VOICE=my_voice` in `.env` to use as default. On Linux, install `sox` manually via your package manager.
+Requires Linux with an NVIDIA GPU.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and adjust as needed:
+Copy `.env.example` to `.env` and edit. Everything is optional:
 
-| Variable        | Default                                          | Description                        |
-|-----------------|--------------------------------------------------|------------------------------------|
-| `PORT`          | 8020                                             | Server port                        |
-| `USE_RL`        | true                                             | Use RL-tuned model variant         |
-| `COSYVOICE_DIR` | CosyVoice                                        | Path to CosyVoice repo            |
-| `MODEL_DIR`     | CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B | Path to model weights             |
-| `DEFAULT_VOICE` | CosyVoice/asset/zero_shot_prompt.wav             | Default voice sample               |
-| `VOICE`         | default                                          | Active voice name                  |
+| Variable             | Default                                          | Description                                  |
+|----------------------|--------------------------------------------------|----------------------------------------------|
+| `PROMPT_WAV`         | `voices/nicoleheart.wav`                         | Reference voice (10-20 s clean mono WAV)     |
+| `VOICE`              | `nicoleheart`                                    | Voice name shown in Home Assistant           |
+| `URI`                | `tcp://0.0.0.0:10211`                            | Wyoming listen address                       |
+| `MODEL_ID`           | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512`           | HuggingFace model downloaded on first run    |
+| `MODEL_DIR`          | `CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B` | Model location                              |
+| `USE_RL`             | `1`                                              | Use the RL-tuned LLM weights                 |
+| `FP16`               | `1`                                              | Half precision                               |
+| `TRT`                | `1`                                              | TensorRT flow decoder                        |
+| `PREBUFFER_SECONDS`  | `1`                                              | Audio buffered before playback starts        |
+| `MIN_MERGED_SECONDS` | `2.5`                                            | Speech merged per model call after the first sentence |
 
-## Inline Tags
+`voices/` is git-ignored, so the reference WAV stays local.
 
-CosyVoice supports inline tags in the text for expressive speech:
+## Tags
 
-`[breath]`, `[laughter]`, `[sigh]`, `[cough]`, `[noise]`, `[lipsmack]`, `[mn]`
+**Mood tags** set the delivery and stay in effect until the next mood tag.
+They can be stacked:
 
-## Performance
+`[warm]` `[happy]` `[excited]` `[confident]` `[serious]` `[sad]` `[angry]`
+`[whisper]` `[loud]` `[slow]` `[fast]` `[robot]`
 
-- **Languages**: Russian + English (cross-lingual)
-- **Voice cloning**: zero-shot from a 3-15s audio sample
-- **Formats**: WAV, MP3
-- **GPU**: Metal (MPS) on Apple Silicon, CUDA on NVIDIA, CPU fallback
-- **Model**: Fun-CosyVoice3-0.5B-RL (~8 GB)
+**Sound tags** are spoken by the model where they appear:
+
+`[laughter]` `[breath]` `[sigh]` `[cough]` `[noise]` `[lipsmack]` `[mn]`
+
+Curly braces and common variants also work, e.g. `(laughs)` becomes
+`[laughter]`. Unknown tags are dropped and logged.
+
+```
+[warm] Good morning! [breath] The coffee is brewing already.
+```
+
+## Home Assistant
+
+1. Add the **Wyoming Protocol** integration with this host and port 10211.
+2. Pick the voice as the text-to-speech engine in your voice assistant.
+3. Paste `ha_prompt.txt` into the conversation agent's instructions so the
+   LLM uses the tags.
+
+## Running as a service
+
+`/etc/systemd/system/cosyvoice-wyoming.service` can run this bridge:
+
+```ini
+[Service]
+WorkingDirectory=/root/cosyvoice-tts-api
+ExecStart=/root/cosyvoice-tts-api/run.sh
+Restart=always
+RestartSec=5
+```
+
+## Files
+
+- `bridge_direct.py`: the Wyoming server (sentence splitting, tag parsing,
+  streaming playback).
+- `run.sh`: setup and launcher.
+- `ha_prompt.txt`: system prompt for the HA conversation agent.
+- `CosyVoice/`: submodule pinned to a fork with segment-timing
+  instrumentation and tuned CosyVoice 3 streaming parameters.
 
 ## Credits
 
-Text-to-speech powered by [CosyVoice](https://github.com/FunAudioLLM/CosyVoice) by FunAudioLLM (Apache-2.0 license).
+Text-to-speech by [CosyVoice](https://github.com/FunAudioLLM/CosyVoice) from
+FunAudioLLM (Apache-2.0).
