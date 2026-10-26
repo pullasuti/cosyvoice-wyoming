@@ -118,6 +118,7 @@ _ABBREVIATIONS = {
 def normalize(text: str) -> str:
     def fix(m: re.Match) -> str:
         key = m.group(1).lower()
+        key = ALIASES.get(key, key)
         return f"[{key}]" if key in TAG_MAP or key in INLINE_TAGS else m.group(0)
     return PAREN_RE.sub(fix, text)
 
@@ -138,7 +139,9 @@ def parse_tags(text: str) -> tuple[str, Optional[str]]:
         if key in TAG_MAP:
             tags.append(TAG_MAP[key])
         elif key in INLINE_TAGS:
-            out.append(f"[{key}]")
+            # TAG_RE swallows the whitespace before the tag; put it back
+            # (the join below collapses any doubled spaces).
+            out.append(f" [{key}] ")
         else:
             _LOGGER.warning("dropping unknown tag %r", tag)
 
