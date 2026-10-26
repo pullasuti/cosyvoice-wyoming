@@ -18,7 +18,7 @@ submodule), builds a Python 3.10 venv, and downloads
 builds the flow-decoder engine, which takes several minutes and is cached
 next to the model. Later runs start straight away.
 
-The bridge listens on `tcp://0.0.0.0:10211` and accepts connections while
+The bridge listens on `tcp://0.0.0.0:10214` and accepts connections while
 the model is still loading.
 
 - `SETUP_ONLY=1 ./run.sh` sets everything up without starting the bridge.
@@ -35,7 +35,7 @@ Copy `.env.example` to `.env` and edit. Everything is optional:
 |----------------------|--------------------------------------------------|----------------------------------------------|
 | `PROMPT_WAV`         | `voices/nicoleheart.wav`                         | Reference voice (10-20 s clean mono WAV)     |
 | `VOICE`              | `nicoleheart`                                    | Voice name shown in Home Assistant           |
-| `URI`                | `tcp://0.0.0.0:10211`                            | Wyoming listen address                       |
+| `URI`                | `tcp://0.0.0.0:10214`                            | Wyoming listen address                       |
 | `MODEL_ID`           | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512`           | HuggingFace model downloaded on first run    |
 | `MODEL_DIR`          | `CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B` | Model location                              |
 | `USE_RL`             | `1`                                              | Use the RL-tuned LLM weights                 |
@@ -67,7 +67,7 @@ Curly braces and common variants also work, e.g. `(laughs)` becomes
 
 ## Home Assistant
 
-1. Add the **Wyoming Protocol** integration with this host and port 10211.
+1. Add the **Wyoming Protocol** integration with this host and port 10214.
 2. Pick the voice as the text-to-speech engine in your voice assistant.
 3. Paste `ha_prompt.txt` into the conversation agent's instructions so the
    LLM uses the tags.

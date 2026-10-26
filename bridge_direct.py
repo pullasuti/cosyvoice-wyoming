@@ -24,7 +24,7 @@ envelope) with anti-stutter and robustness measures:
      CUDA. Silently disabled by CosyVoice if no CUDA device is visible
      (startup log + post-load check surface that).
 
-Startup order: bind :10211 immediately, load the model in the
+Startup order: bind :10214 immediately, load the model in the
 background, queue any sentences that arrive during the load.
 
 Must run inside the CosyVoice venv (torch, numpy, wyoming, and the
@@ -755,7 +755,7 @@ class BridgeHandler(AsyncEventHandler):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CosyVoice Wyoming bridge (direct)")
-    p.add_argument("--uri", default="tcp://0.0.0.0:10211", help="Wyoming server URI")
+    p.add_argument("--uri", default="tcp://0.0.0.0:10214", help="Wyoming server URI")
     p.add_argument(
         "--cosyvoice-repo",
         default="CosyVoice",
