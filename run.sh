@@ -32,6 +32,7 @@ FP16="${FP16:-1}"
 TRT="${TRT:-1}"
 PREBUFFER_SECONDS="${PREBUFFER_SECONDS:-1}"
 MIN_MERGED_SECONDS="${MIN_MERGED_SECONDS:-2.5}"
+DEFAULT_MOOD="${DEFAULT_MOOD-warm}"
 
 # Only needed for setup; systemd's PATH usually lacks ~/.local/bin.
 ensure_uv() {
@@ -98,6 +99,7 @@ ARGS=(
     --uri "$URI"
     --prebuffer-seconds "$PREBUFFER_SECONDS"
     --min-merged-seconds "$MIN_MERGED_SECONDS"
+    --default-mood "$DEFAULT_MOOD"
 )
 [ "$USE_RL" = 1 ] && ARGS+=(--use-rl)
 [ "$FP16" = 1 ] && ARGS+=(--fp16)

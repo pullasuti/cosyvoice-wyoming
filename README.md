@@ -35,6 +35,7 @@ Copy `.env.example` to `.env` and edit. Everything is optional:
 |----------------------|--------------------------------------------------|----------------------------------------------|
 | `PROMPT_WAV`         | `voices/nicoleheart.wav`                         | Reference voice (10-20 s clean mono WAV)     |
 | `VOICE`              | `nicoleheart`                                    | Voice name shown in Home Assistant           |
+| `DEFAULT_MOOD`       | `warm`                                           | Mood for text before any mood tag (empty disables) |
 | `URI`                | `tcp://0.0.0.0:10214`                            | Wyoming listen address                       |
 | `MODEL_ID`           | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512`           | HuggingFace model downloaded on first run    |
 | `MODEL_DIR`          | `CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B` | Model location                              |
@@ -49,7 +50,7 @@ Copy `.env.example` to `.env` and edit. Everything is optional:
 ## Tags
 
 **Mood tags** set the delivery and stay in effect until the next mood tag.
-They can be stacked:
+They can be stacked. Text before any mood tag uses `DEFAULT_MOOD` (`warm`):
 
 `[warm]` `[happy]` `[excited]` `[confident]` `[serious]` `[sad]` `[angry]`
 `[whisper]` `[loud]` `[slow]` `[fast]` `[robot]`

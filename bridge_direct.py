@@ -609,7 +609,8 @@ class BridgeHandler(AsyncEventHandler):
             if instructions:
                 self._instr = instructions
 
-            _LOGGER.info("synthesizing: text=%r instr=%r", clean[:60], self._instr)
+            _LOGGER.info("synthesizing: text=%r instr=%r", clean[:60],
+                         self._instr or self.engine.default_instruct)
 
             try:
                 await self._stream_block(clean, self._instr)
@@ -873,7 +874,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--instruct",
         default=None,
-        help="Baseline instruction applied to every sentence (tag overrides it)",
+        help="Baseline instruction applied to every sentence (tag overrides it); "
+        "takes precedence over --default-mood",
+    )
+    p.add_argument(
+        "--default-mood",
+        default="warm",
+        help="Mood tag for text before any mood tag, so untagged text uses the "
+        "same instruct mode as tagged text ('' or 'none' disables). "
+        f"One of: {', '.join(TAG_MAP)}",
     )
     p.add_argument("--speed", type=float, default=1.0, help="1.0 = normal")
     p.add_argument(
@@ -935,12 +944,24 @@ async def main() -> None:
 
     model_dir = args.model_dir or str(repo / "pretrained_models" / "Fun-CosyVoice3-0.5B")
 
+    default_instruct = args.instruct
+    mood = args.default_mood.strip().strip("[]").lower()
+    if default_instruct is None and mood not in ("", "none"):
+        mood = ALIASES.get(mood, mood)
+        if mood not in TAG_MAP:
+            raise SystemExit(
+                f"unknown --default-mood {args.default_mood!r}; "
+                f"choose from: {', '.join(TAG_MAP)}"
+            )
+        default_instruct = TAG_MAP[mood]
+    _LOGGER.info("instruction for untagged text: %r", default_instruct)
+
     engine = SynthEngine(
         model_dir=model_dir,
         prompt_wav=args.prompt_wav,
         prompt_text=args.prompt_text,
         mode=args.mode,
-        default_instruct=args.instruct,
+        default_instruct=default_instruct,
         speed=args.speed,
         use_rl=args.use_rl,
         fp16=args.fp16,
