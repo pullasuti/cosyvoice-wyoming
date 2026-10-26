@@ -89,6 +89,9 @@ RestartSec=5
 - `bridge_direct.py`: the Wyoming server (sentence splitting, tag parsing,
   streaming playback).
 - `run.sh`: setup and launcher.
+- `test_bridge.py`: test client for a running bridge. It covers one-shot and
+  streaming requests, the duplicate requests HA sends, and blank text
+  (`.venv/bin/python test_bridge.py [--host HOST] [--port PORT]`).
 - `ha_prompt.txt`: system prompt for the HA conversation agent.
 - `CosyVoice/`: submodule pinned to a fork with segment-timing
   instrumentation and tuned CosyVoice 3 streaming parameters.
