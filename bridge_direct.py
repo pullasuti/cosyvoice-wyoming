@@ -23,6 +23,11 @@ envelope) with anti-stutter and robustness measures:
   7. fp16 — AutoModel(model_dir=..., fp16=True) halves compute on
      CUDA. Silently disabled by CosyVoice if no CUDA device is visible
      (startup log + post-load check surface that).
+  8. ONE-SHOT REQUESTS — a plain synthesize (tts.speak, "Try voice") is
+     synthesized and answered with audio-start/chunks/audio-stop. The
+     copy HA sends alongside a stream, or right after it, is ignored.
+  9. WARMUP — one throwaway synthesis after load, so the first real
+     request starts as fast as later ones.
 
 Startup order: bind :10214 immediately, load the model in the
 background, queue any sentences that arrive during the load.
@@ -69,6 +74,14 @@ EOP = "<|endofprompt|>"
 
 # Rough speech-rate estimate for merging decisions: ~2.8 words/second.
 WORDS_PER_SECOND = 2.8
+
+# A one-shot synthesize arriving this soon after synthesize-stop, with
+# matching text, is a late duplicate of the stream just played, not a request.
+LATE_DUPLICATE_WINDOW_S = 3.0
+
+# Synthesized once at startup so the first real request doesn't pay for
+# reference-feature extraction and CUDA/TensorRT warmup.
+WARMUP_TEXT = "Hello there."
 
 # ---------------------------------------------------------------------------
 # Tag handling — values are BARE instruction bodies, wrapped at call time.
@@ -181,6 +194,11 @@ def speed_hint(speed: float) -> Optional[str]:
 def estimate_seconds(text: str) -> float:
     """Very rough spoken-duration estimate for merging decisions."""
     return len(text.split()) / WORDS_PER_SECOND
+
+
+def norm_text(text: str) -> str:
+    """Tag-free, whitespace- and case-insensitive form for duplicate checks."""
+    return " ".join(TAG_RE.sub(" ", text).split()).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +427,20 @@ class SynthEngine:
         if not self.prompt_wav or not os.path.exists(self.prompt_wav):
             raise RuntimeError(f"prompt WAV not found: {self.prompt_wav!r}")
 
+        self._warmup()
+
+    def _warmup(self) -> None:
+        """Run one throwaway synthesis on the instruct path (what tagged
+        replies use), filling the reference-feature cache and warming CUDA."""
+        t0 = time.monotonic()
+        try:
+            for _ in self.synthesize_iter(WARMUP_TEXT, TAG_MAP["warm"]):
+                pass
+        except Exception:
+            _LOGGER.warning("warmup synthesis failed", exc_info=True)
+            return
+        _LOGGER.info("warmup done in %.1fs", time.monotonic() - t0)
+
     # -- inference ----------------------------------------------------------
 
     def _call(self, text: str, instructions: Optional[str]) -> Iterator[Any]:
@@ -484,6 +516,12 @@ class BridgeHandler(AsyncEventHandler):
         # Sentence merging accumulator
         self._pending_sentences: list[str] = []
         self._first_queued = False
+
+        # Duplicate detection for the one-shot synthesize HA sends with a stream
+        self._streaming = False
+        self._stream_text = ""
+        self._last_stream_norm = ""
+        self._last_stream_end = 0.0
 
         self._work_q: Optional[asyncio.Queue] = None
         self._play_q: Optional[asyncio.Queue] = None
@@ -706,22 +744,17 @@ class BridgeHandler(AsyncEventHandler):
             return True
 
         if SynthesizeStart.is_type(event.type):
-            self._stash = ""
-            self._buf = ""
-            self._got_chunks = False
-            self._audio_started = False
-            self._stream_rate = None
-            self._instr = None
-            self._pending_sentences = []
-            self._first_queued = False
+            self._reset_utterance()
+            self._streaming = True
+            self._stream_text = ""
             await self._start_pipeline()
             return True
 
         if SynthesizeChunk.is_type(event.type):
             self._got_chunks = True
-            for sentence in self._take_sentences(
-                SynthesizeChunk.from_event(event).text
-            ):
+            chunk_text = SynthesizeChunk.from_event(event).text
+            self._stream_text += chunk_text
+            for sentence in self._take_sentences(chunk_text):
                 self._feed_sentence(sentence)
             return True
 
@@ -734,22 +767,74 @@ class BridgeHandler(AsyncEventHandler):
             else:
                 text = self._stash
                 self._stash = ""
+                self._stream_text = text
                 if text.strip():
                     self._feed_sentence(text.strip())
 
-            await self._stop_pipeline()
+            await self._finish_utterance()
 
-            if self._audio_started:
-                await self.write_event(AudioStop().event())
-                self._audio_started = False
+            self._streaming = False
+            self._last_stream_norm = norm_text(self._stream_text)
+            self._last_stream_end = time.monotonic()
             await self.write_event(SynthesizeStopped().event())
             return True
 
         if Synthesize.is_type(event.type):
-            self._stash = Synthesize.from_event(event).text
+            text = Synthesize.from_event(event).text or ""
+
+            # (1) Compat one-shot that HA sends alongside a stream: ignore
+            #     (but keep it as the text for a start/stop with no chunks).
+            if self._streaming:
+                self._stash = text
+                return True
+
+            # (2) Late duplicate right after a finished stream.
+            if (self._last_stream_norm
+                    and time.monotonic() - self._last_stream_end
+                    < LATE_DUPLICATE_WINDOW_S
+                    and norm_text(text) == self._last_stream_norm):
+                _LOGGER.warning(
+                    "late duplicate of finished stream suppressed: %r",
+                    text[:60])
+                return True
+
+            # (3) Genuine non-streaming request (tts.speak, "Try voice", ...)
+            self._reset_utterance()
+            await self._start_pipeline()
+            for sentence in self._take_sentences(text + " "):
+                self._feed_sentence(sentence)
+            tail = self._buf.strip()
+            self._buf = ""
+            if tail:
+                self._feed_sentence(tail)
+            await self._finish_utterance(always_audio=True)
             return True
 
         return True
+
+    def _reset_utterance(self) -> None:
+        self._stash = ""
+        self._buf = ""
+        self._got_chunks = False
+        self._audio_started = False
+        self._stream_rate = None
+        self._instr = None
+        self._pending_sentences = []
+        self._first_queued = False
+
+    async def _finish_utterance(self, always_audio: bool = False) -> None:
+        """Drain the pipeline and close the audio stream. A one-shot client
+        waits for audio-stop, so always_audio sends an empty start/stop pair
+        when nothing was synthesized (blank text, every block failed)."""
+        await self._stop_pipeline()
+        if not self._audio_started and always_audio:
+            await self.write_event(
+                AudioStart(rate=self.sample_rate, width=2, channels=1).event()
+            )
+            self._audio_started = True
+        if self._audio_started:
+            await self.write_event(AudioStop().event())
+            self._audio_started = False
 
 
 # ---------------------------------------------------------------------------
