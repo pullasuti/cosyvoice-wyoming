@@ -79,8 +79,8 @@ Curly braces and common variants also work, e.g. `(laughs)` becomes
 
 ```ini
 [Service]
-WorkingDirectory=/root/cosyvoice-tts-api
-ExecStart=/root/cosyvoice-tts-api/run.sh
+WorkingDirectory=/root/cosyvoice-wyoming
+ExecStart=/root/cosyvoice-wyoming/run.sh
 Restart=always
 RestartSec=5
 ```
@@ -101,3 +101,7 @@ RestartSec=5
 
 Text-to-speech by [CosyVoice](https://github.com/FunAudioLLM/CosyVoice) from
 FunAudioLLM (Apache-2.0).
+
+Started from [x0152/cosyvoice-tts-api](https://github.com/x0152/cosyvoice-tts-api),
+an OpenAI-compatible CosyVoice HTTP server; `run.sh`'s dependency setup comes
+from there.
